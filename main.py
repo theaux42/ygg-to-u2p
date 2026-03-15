@@ -1,5 +1,8 @@
 import os
 import sys
+import base64
+import time
+from urllib.parse import quote, urlsplit, urlunsplit
 from abc import ABC, abstractmethod
 from dotenv import load_dotenv
 
@@ -12,6 +15,12 @@ QB_PASSWORD       = os.getenv("QB_PASSWORD", "adminadmin")
 TR_HOST           = os.getenv("TR_HOST", "http://localhost:9091")
 TR_USERNAME       = os.getenv("TR_USERNAME", "admin")
 TR_PASSWORD       = os.getenv("TR_PASSWORD", "admin")
+RT_ADDRESS        = os.getenv("RT_ADDRESS", "scgi://127.0.0.1:5000")
+RT_TIMEOUT        = float(os.getenv("RT_TIMEOUT", "5.0"))
+RT_USERNAME       = os.getenv("RT_USERNAME", "")
+RT_PASSWORD       = os.getenv("RT_PASSWORD", "")
+RT_RETRY_ATTEMPTS = max(1, int(os.getenv("RT_RETRY_ATTEMPTS", "6")))
+RT_RETRY_DELAY    = max(0.0, float(os.getenv("RT_RETRY_DELAY", "1.0")))
 TRACKERS_FILE     = os.getenv("TRACKERS_FILE", "trackers.txt")
 TARGET_DOMAINS    = [
     "gopeers.cc",
@@ -144,6 +153,51 @@ class TransmissionClient(TorrentClient):
             self._client.change_torrent(torrent.id, tracker_remove=[tracker_id])
 
 
+# ─── rTorrent ────────────────────────────────────────────────────
+
+class RTorrentClient(TorrentClient):
+    def __init__(self, address: str, timeout: float):
+        from rtorrent_rpc import RTorrent  # type: ignore[import-not-found]
+        self._client = RTorrent(address=address, timeout=timeout)
+        self._address = redact_auth_in_address(address)
+        configure_rtorrent_http_basic_auth(self._client, address)
+
+    def connect(self) -> None:
+        try:
+            # Trigger one lightweight call to validate connectivity.
+            self._client.system_list_methods()
+        except Exception as e:
+            print(f"[ERREUR] Connexion échouée : {e}")
+            sys.exit(1)
+        print(f"[INFO] Connecté à rTorrent ({self._address})")
+
+    def disconnect(self) -> None:
+        pass  # rtorrent-rpc n'a pas de logout explicite
+
+    def get_torrents(self) -> list:
+        # Keep hashes as torrent handles to avoid extra object wrappers.
+        return self._client.download_list()
+
+    def get_torrent_name(self, torrent) -> str:
+        return self._client.d.name(torrent)
+
+    def get_tracker_urls(self, torrent) -> list[str]:
+        trackers = self._client.t.multicall(torrent, "", "t.url=")
+        return [t[0] for t in trackers if t and t[0]]
+
+    def add_trackers(self, torrent, urls: list[str]) -> None:
+        for url in urls:
+            self._client.d_add_tracker(torrent, url)
+
+    def remove_tracker(self, torrent, url: str) -> None:
+        # rTorrent XML-RPC does not expose hard tracker deletion reliably,
+        # so we disable matching trackers instead.
+        trackers = self._client.t.multicall(torrent, "", "t.is_enabled=", "t.url=")
+        for idx, tracker in enumerate(trackers):
+            if len(tracker) >= 2 and tracker[1] == url and tracker[0]:
+                self._client.t_disable_tracker(torrent, idx)
+
+
 # ─── Helpers ──────────────────────────────────────────────────────
 
 def build_client() -> TorrentClient:
@@ -151,8 +205,102 @@ def build_client() -> TorrentClient:
         return QBittorrentClient(QB_HOST, QB_USERNAME, QB_PASSWORD)
     if CLIENT_TYPE == "transmission":
         return TransmissionClient(TR_HOST, TR_USERNAME, TR_PASSWORD)
+    if CLIENT_TYPE == "rtorrent":
+        return RTorrentClient(RT_ADDRESS, RT_TIMEOUT)
     print(f"[ERREUR] Client inconnu : {CLIENT_TYPE}")
     sys.exit(1)
+
+
+def with_http_basic_auth(address: str) -> str:
+    parsed = urlsplit(address)
+    if parsed.scheme not in {"http", "https"}:
+        return address
+
+    if parsed.username or not RT_USERNAME:
+        return address
+
+    auth = quote(RT_USERNAME, safe="")
+    if RT_PASSWORD:
+        auth = f"{auth}:{quote(RT_PASSWORD, safe='')}"
+
+    netloc = f"{auth}@{parsed.hostname or ''}"
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+
+def configure_rtorrent_http_basic_auth(client, address: str) -> None:
+    parsed = urlsplit(address)
+    if parsed.scheme not in {"http", "https"} or not RT_USERNAME:
+        return
+
+    transport = getattr(client, "_transport", None)
+    pool = getattr(transport, "_pool", None)
+    if transport is None or pool is None:
+        return
+
+    path = parsed.path or "/RPC2"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+
+    token = base64.b64encode(f"{RT_USERNAME}:{RT_PASSWORD}".encode("utf-8")).decode("ascii")
+
+    def request_with_basic_auth(body: bytes, content_type: str | None = None) -> bytes:
+        transient_status = {429, 500, 502, 503, 504}
+
+        for attempt in range(1, RT_RETRY_ATTEMPTS + 1):
+            headers = {"authorization": f"Basic {token}"}
+            if content_type:
+                headers["content-type"] = content_type
+
+            try:
+                res = pool.request(
+                    method="POST",
+                    url=path,
+                    body=body,
+                    redirect=False,
+                    headers=headers,
+                )
+            except Exception as e:
+                if attempt == RT_RETRY_ATTEMPTS:
+                    raise RuntimeError(f"échec après {attempt} tentative(s): {e}") from e
+
+                delay = RT_RETRY_DELAY * (2 ** (attempt - 1))
+                print(f"[RETRY] rTorrent requête échouée ({e}) — tentative {attempt}/{RT_RETRY_ATTEMPTS}, pause {delay:.1f}s")
+                time.sleep(delay)
+                continue
+
+            res_body = res.data
+            if res.status in (200, 204):
+                return res_body
+
+            if res.status in transient_status and attempt < RT_RETRY_ATTEMPTS:
+                delay = RT_RETRY_DELAY * (2 ** (attempt - 1))
+                print(f"[RETRY] rTorrent HTTP {res.status} — tentative {attempt}/{RT_RETRY_ATTEMPTS}, pause {delay:.1f}s")
+                time.sleep(delay)
+                continue
+
+            raise RuntimeError(f"unexpected response status code {res.status} {res_body!r}")
+
+        raise RuntimeError("rTorrent: échec de requête après retries")
+
+    transport.request = request_with_basic_auth
+
+
+def redact_auth_in_address(address: str) -> str:
+    parsed = urlsplit(address)
+    if not parsed.username:
+        return address
+
+    # Keep username visible for diagnostics while hiding secret.
+    username = parsed.username
+    host = parsed.hostname or ""
+    netloc = f"{username}:***@{host}"
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
 
 
 def load_trackers(filepath: str) -> list[str]:
