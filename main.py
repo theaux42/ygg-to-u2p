@@ -172,7 +172,11 @@ class RTorrentClient(TorrentClient):
         print(f"[INFO] Connecté à rTorrent ({self._address})")
 
     def disconnect(self) -> None:
-        pass  # rtorrent-rpc n'a pas de logout explicite
+        try:
+            self._client.session_save()
+            print("[INFO] rTorrent session sauvegardée")
+        except Exception as e:
+            print(f"[AVERT] Impossible de sauvegarder la session rTorrent : {e}")
 
     def get_torrents(self) -> list:
         # Keep hashes as torrent handles to avoid extra object wrappers.
