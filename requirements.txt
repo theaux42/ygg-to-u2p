@@ -1,3 +1,4 @@
 qbittorrent-api
 transmission-rpc
+rtorrent-rpc
 python-dotenv
